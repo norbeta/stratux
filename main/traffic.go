@@ -71,34 +71,40 @@ const (
 	// (code corresponds to any UAT GBT targets with Mode S addresses.
 	// These will be displayed with the airplane icon on the traffic UI page.
 	// If we see a proper emitter category and NIC > 7, they'll be reassigned to TYPE_ADSR.
-	TARGET_TYPE_TISB_S = 3
-	TARGET_TYPE_TISB   = 4
+	TARGET_TYPE_TISB_S          = 3
+	TARGET_TYPE_TISB            = 4
+	SIGNAL_STRENGTH_AVG_N_SHORT = 40 // number of samples used to calulate short rolling average of signal strength
+	SIGNAL_STRENGTH_AVG_N_LONG  = 50 // number of samples used to calulate long rolling average of signal strength
 )
 
 type TrafficInfo struct {
-	Icao_addr           uint32
-	Reg                 string    // Registration. Calculated from Icao_addr for civil aircraft of US registry.
-	Tail                string    // Callsign. Transmitted by aircraft.
-	Emitter_category    uint8     // Formatted using GDL90 standard, e.g. in a Mode ES report, A7 becomes 0x07, B0 becomes 0x08, etc.
-	OnGround            bool      // Air-ground status. On-ground is "true".
-	Addr_type           uint8     // UAT address qualifier. Used by GDL90 format, so translations for ES TIS-B/ADS-R are needed.
-	TargetType          uint8     // types decribed in const above
-	SignalLevel         float64   // Signal level, dB RSSI.
-	Squawk              int       // Squawk code
-	Position_valid      bool      //TODO: set when position report received. Unset after n seconds?
-	Lat                 float32   // decimal degrees, north positive
-	Lng                 float32   // decimal degrees, east positive
-	Alt                 int32     // Pressure altitude, feet
-	GnssDiffFromBaroAlt int32     // GNSS altitude above WGS84 datum. Reported in TC 20-22 messages
-	AltIsGNSS           bool      // Pressure alt = 0; GNSS alt = 1
-	NIC                 int       // Navigation Integrity Category.
-	NACp                int       // Navigation Accuracy Category for Position.
-	Track               uint16    // degrees true
-	Speed               uint16    // knots
-	Speed_valid         bool      // set when speed report received.
-	Vvel                int16     // feet per minute
-	Timestamp           time.Time // timestamp of traffic message, UTC
-	PriorityStatus      uint8     // Emergency or priority code as defined in GDL90 spec, DO-260B (Type 28 msg) and DO-282B
+	Icao_addr               uint32
+	Reg                     string    // Registration. Calculated from Icao_addr for civil aircraft of US registry.
+	Tail                    string    // Callsign. Transmitted by aircraft.
+	Emitter_category        uint8     // Formatted using GDL90 standard, e.g. in a Mode ES report, A7 becomes 0x07, B0 becomes 0x08, etc.
+	OnGround                bool      // Air-ground status. On-ground is "true".
+	Addr_type               uint8     // UAT address qualifier. Used by GDL90 format, so translations for ES TIS-B/ADS-R are needed.
+	TargetType              uint8     // types decribed in const above
+	SignalLevel             float64   // Signal level, dB RSSI.
+	SignalLevelAvgShort     float64   // Short rolling average of signal level, dB RSSI
+	SignalLevelAvgLong      float64   // Long rolling average of signal level, dB RSSI
+	SignalLevelSampleCount  uint64    // Number of samples seen for rolling average calculation
+	IsSignalLevelIncreasing bool      // Flag that indicates that signal level is increasing (traffic is getting closer)
+	Squawk                  int       // Squawk code
+	Position_valid          bool      //TODO: set when position report received. Unset after n seconds?
+	Lat                     float32   // decimal degrees, north positive
+	Lng                     float32   // decimal degrees, east positive
+	Alt                     int32     // Pressure altitude, feet
+	GnssDiffFromBaroAlt     int32     // GNSS altitude above WGS84 datum. Reported in TC 20-22 messages
+	AltIsGNSS               bool      // Pressure alt = 0; GNSS alt = 1
+	NIC                     int       // Navigation Integrity Category.
+	NACp                    int       // Navigation Accuracy Category for Position.
+	Track                   uint16    // degrees true
+	Speed                   uint16    // knots
+	Speed_valid             bool      // set when speed report received.
+	Vvel                    int16     // feet per minute
+	Timestamp               time.Time // timestamp of traffic message, UTC
+	PriorityStatus          uint8     // Emergency or priority code as defined in GDL90 spec, DO-260B (Type 28 msg) and DO-282B
 
 	// Parameters starting at 'Age' are calculated from last message receipt on each call of sendTrafficUpdates().
 	// Mode S transmits position and track in separate messages, and altitude can also be
@@ -152,6 +158,10 @@ type esmsg struct {
 var traffic map[uint32]TrafficInfo
 var trafficMutex *sync.Mutex
 var seenTraffic map[uint32]bool // Historical list of all ICAO addresses seen.
+
+// minimum/maximum signal strength ever seen (used for displaying traffic without position information)
+var minSignalLevel1090 float64
+var maxSignalLevel1090 float64
 
 var OwnshipTrafficInfo TrafficInfo
 
@@ -224,16 +234,31 @@ func sendTrafficUpdates() {
 		if ti.Age > 2 { // if nothing polls an inactive ti, it won't push to the webUI, and its Age won't update.
 			trafficUpdate.SendJSON(ti)
 		}
-		if ti.Position_valid && ti.Age < 6 { // ... but don't pass stale data to the EFB.
-			//TODO: Coast old traffic? Need to determine how FF, WingX, etc deal with stale targets.
-			logTraffic(ti) // only add to the SQLite log if it's not stale
 
-			if ti.Icao_addr == uint32(code) {
-				if globalSettings.DEBUG {
-					log.Printf("Ownship target detected for code %X\n", code)
+		if ti.Position_valid { // check if target has valid position
+			if ti.Age < 6 { // check for recent location information
+				//TODO: Coast old traffic? Need to determine how FF, WingX, etc deal with stale targets.
+				logTraffic(ti) // only add to the SQLite log if it's not stale
+
+				if ti.Icao_addr == uint32(code) {
+					if globalSettings.DEBUG {
+						log.Printf("Ownship target detected for code %X\n", code)
+					}
+					//				OwnshipTrafficInfo = ti
+				} else {
+					cur_n := len(msgs) - 1
+					if len(msgs[cur_n]) >= 35 {
+						// Batch messages into packets with at most 35 traffic reports
+						//  to keep each packet under 1KB.
+						cur_n++
+						msgs = append(msgs, make([]byte, 0))
+					}
+					msgs[cur_n] = append(msgs[cur_n], makeTrafficReportMsg(ti)...)
 				}
-				//				OwnshipTrafficInfo = ti
-			} else {
+			}
+		} else { // no valid position
+			// check for recent valid altitude information and increasing signal strength (traffic is getting closer)
+			if ti.AgeLastAlt < 6 && ti.IsSignalLevelIncreasing {
 				cur_n := len(msgs) - 1
 				if len(msgs[cur_n]) >= 35 {
 					// Batch messages into packets with at most 35 traffic reports
@@ -241,7 +266,22 @@ func sendTrafficUpdates() {
 					cur_n++
 					msgs = append(msgs, make([]byte, 0))
 				}
-				msgs[cur_n] = append(msgs[cur_n], makeTrafficReportMsg(ti)...)
+
+				// calculate fake distance between 0 and 10 NM based on signal strength
+				fakeDistanceRelative := 1.0 - ((ti.SignalLevelAvgShort - minSignalLevel1090) / (maxSignalLevel1090 - minSignalLevel1090))
+				fakeDistanceNm := fakeDistanceRelative * 10.0
+
+				// copy traffic info to add fake position
+				tiFake := TrafficInfo(ti)
+
+				// fake position will be fakeDistanceNm away from current own position right in the current flight direction
+				fakeLat, fakeLon := calcLocationForBearingDistance(float64(mySituation.GPSLatitude), float64(mySituation.GPSLongitude), float64(mySituation.GPSTrueCourse), fakeDistanceNm)
+				tiFake.Lat = float32(fakeLat)
+				tiFake.Lng = float32(fakeLon)
+
+				// log.Printf("Calculated fake location: icao_addr=%d, signal=%f, distance_rel=%f, distance_abs=%f lat=%f, lon=%f", ti.Icao_addr, ti.SignalLevelAvgShort, fakeDistanceRelative, fakeDistanceNm, tiFake.Lat, tiFake.Lng)
+
+				msgs[cur_n] = append(msgs[cur_n], makeTrafficReportMsg(tiFake)...)
 			}
 		}
 	}
@@ -837,6 +877,28 @@ func esListen() {
 
 			if newTi.SignalLevel > 0 {
 				ti.SignalLevel = 10 * math.Log10(newTi.SignalLevel)
+
+				// calculate rolling averages of signal strength
+				ti.SignalLevelAvgShort -= ti.SignalLevelAvgShort / SIGNAL_STRENGTH_AVG_N_SHORT
+				ti.SignalLevelAvgShort += ti.SignalLevel / SIGNAL_STRENGTH_AVG_N_SHORT
+				ti.SignalLevelAvgLong -= ti.SignalLevelAvgLong / SIGNAL_STRENGTH_AVG_N_LONG
+				ti.SignalLevelAvgLong += ti.SignalLevel / SIGNAL_STRENGTH_AVG_N_LONG
+				ti.SignalLevelSampleCount += 1
+
+				// check if signal strength is increasing
+				if ti.SignalLevelSampleCount >= SIGNAL_STRENGTH_AVG_N_LONG && ti.SignalLevelAvgShort > ti.SignalLevelAvgLong {
+					ti.IsSignalLevelIncreasing = true
+				} else {
+					ti.IsSignalLevelIncreasing = false
+				}
+
+				// update global min/max signal level information
+				if minSignalLevel1090 == 0 || minSignalLevel1090 > ti.SignalLevel {
+					minSignalLevel1090 = ti.SignalLevel
+				}
+				if maxSignalLevel1090 == 0 || maxSignalLevel1090 < ti.SignalLevel {
+					maxSignalLevel1090 = ti.SignalLevel
+				}
 			} else {
 				ti.SignalLevel = -999
 			}
@@ -1361,6 +1423,8 @@ func initTraffic() {
 	traffic = make(map[uint32]TrafficInfo)
 	seenTraffic = make(map[uint32]bool)
 	trafficMutex = &sync.Mutex{}
+	minSignalLevel1090 = 0.0
+	maxSignalLevel1090 = 0.0
 	go esListen()
 	go flarmListen()
 }
