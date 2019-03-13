@@ -3,6 +3,11 @@
 [![BSD3 License](http://img.shields.io/badge/license-BSD3-brightgreen.svg)](https://tldrlegal.com/license/bsd-3-clause-license-%28revised%29)
 [![Stratux Slack](http://slack.stratux.me:3000/badge.svg)](http://slack.stratux.me/)
 
+# Note about this fork
+This is norbeta's fork of the v1.5b2-2296b3ade. This includes:
+* FLARM support, X-Plane output and no position traffic (by 0x74-0x62)
+* "--modeac" added on by default
+
 # stratux
 RTL-SDR UAT tools
 
